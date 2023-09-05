@@ -56,12 +56,12 @@ fn test_modmap_multi_purpose_key() {
     modmap:
       - remap:
           Space:
-            held: Shift_L
-            alone: Space
+            held: [Shift_L]
+            alone: [Space]
       - remap:
           Muhenkan:
-            held: Alt_L
-            alone: Muhenkan
+            held: [Alt_L]
+            alone: [Muhenkan]
             alone_timeout_millis: 500
     "})
 }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer};
 use serde_with::{serde_as, DurationMilliSeconds};
 use std::time::Duration;
 
-use super::keymap_action::{Actions, KeymapAction};
+use super::{keymap_action::{Actions, KeymapAction}, deserialize_virtual_modifiers};
 
 // Values in `modmap.remap`
 #[derive(Clone, Debug, Deserialize)]
@@ -19,10 +19,8 @@ pub enum ModmapAction {
 #[serde_as]
 #[derive(Clone, Debug, Deserialize)]
 pub struct MultiPurposeKey {
-    #[serde(deserialize_with = "deserialize_key")]
-    pub held: Key,
-    #[serde(deserialize_with = "deserialize_key")]
-    pub alone: Key,
+    pub held: Keys,
+    pub alone: Keys,
     #[serde_as(as = "DurationMilliSeconds")]
     #[serde(default = "default_alone_timeout", rename = "alone_timeout_millis")]
     pub alone_timeout: Duration,
@@ -34,6 +32,24 @@ pub struct PressReleaseKey {
     pub press: Vec<KeymapAction>,
     #[serde(deserialize_with = "deserialize_actions")]
     pub release: Vec<KeymapAction>,
+}
+// Used only for deserializing Vec<Keys>
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum Keys {
+    #[serde(deserialize_with = "deserialize_key")]
+    Key(Key),
+    #[serde(deserialize_with = "deserialize_virtual_modifiers")]
+    Keys(Vec<Key>),
+}
+
+impl Keys {
+    pub fn into_vec(self) -> Vec<Key> {
+        match self {
+            Keys::Key(key) => vec![key],
+            Keys::Keys(keys) => keys,
+        }
+    }
 }
 
 pub fn deserialize_actions<'de, D>(deserializer: D) -> Result<Vec<KeymapAction>, D::Error>
