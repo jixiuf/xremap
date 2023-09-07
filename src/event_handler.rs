@@ -108,7 +108,7 @@ impl EventHandler {
     fn on_key_event(&mut self, event: &KeyEvent, config: &Config) -> Result<bool, Box<dyn Error>> {
         self.application_cache = None; // expire cache
         let key = Key::new(event.code());
-        debug!("=> {}: {:?}", event.value(), &key);
+        debug!("=========================> {}: {:?}", event.value(), &key);
 
         // Apply modmap
         let mut key_values = if let Some(key_action) = self.find_modmap(config, &key) {
@@ -123,7 +123,9 @@ impl EventHandler {
 
         let mut send_original_relative_event = false;
         // Apply keymap
+        debug!("before for {:?}",key_values); 
         for (key, value) in key_values.into_iter() {
+            debug!("forkeye=>  {:?} {}", &key,value);
             if config.virtual_modifiers.contains(&key) {
                 self.update_modifier(key, value);
                 continue;
@@ -133,6 +135,7 @@ impl EventHandler {
                 if self.escape_next_key {
                     self.escape_next_key = false
                 } else if let Some(actions) = self.find_keymap(config, &key)? {
+                    debug!("dispatch_actions=> {}: {:?} {}", event.value(), &key,value);
                     self.dispatch_actions(&actions, &key)?;
                     continue;
                 }
@@ -145,8 +148,10 @@ impl EventHandler {
                 send_original_relative_event = true;
                 continue;
             }
+            debug!("send_key {:?} {}" ,&key,value); 
             self.send_key(&key, value);
         }
+        debug!("end for"); 
 
         // Using the Ok() to send a boolean to on_relative_event, which will be used to decide whether to send the original relative event.
         // (True = send the original relative event, false = don't send it.)
@@ -262,7 +267,20 @@ impl EventHandler {
     }
 
     fn send_action(&mut self, action: Action) {
+        debug!("pushaction {:?}",action);
         self.actions.push(action);
+    }
+    fn remove_key(&mut self, event: KeyEvent) {
+        self.actions.retain(|a|         match a {
+            Action::KeyEvent(e) =>
+                if event.code()==e.code()&&event.value()==e.value(){
+                    false
+                }else{
+                    true
+                }
+                ,
+            _ => true
+        })
     }
 
     // Repeat/Release what's originally pressed even if remapping changes while holding it
@@ -512,23 +530,29 @@ impl EventHandler {
     fn send_key_press(&mut self, key_press: &KeyPress) {
         // Build extra or missing modifiers. Note that only MODIFIER_KEYS are handled
         // because logical modifiers shouldn't make an impact outside xremap.
+        debug!("send_key_press key_press {:?}",key_press);
         let (mut extra_modifiers, mut missing_modifiers) = self.diff_modifiers(&key_press.modifiers);
+        debug!("extra_modifiers{:?} missing_modifiers {:?}",extra_modifiers,missing_modifiers);
         extra_modifiers.retain(|key| MODIFIER_KEYS.contains(&key) && !self.extra_modifiers.contains(&key));
         missing_modifiers.retain(|key| MODIFIER_KEYS.contains(&key));
+        debug!("after extra_modifiers{:?} missing_modifiers {:?}",extra_modifiers,missing_modifiers);
 
         // Emulate the modifiers of KeyPress
         self.send_keys(&missing_modifiers, PRESS);
         self.send_keys(&extra_modifiers, RELEASE);
+        debug!("after Emulate");
 
         // Press the main key
         self.send_key(&key_press.key, PRESS);
         self.send_key(&key_press.key, RELEASE);
+        debug!("after Press the main key");
 
         self.send_action(Action::Delay(self.keypress_delay));
 
         // Resurrect the original modifiers
         self.send_keys(&extra_modifiers, PRESS);
         self.send_keys(&missing_modifiers, RELEASE);
+        debug!("after Resurrect");
     }
 
     fn with_mark(&self, key_press: &KeyPress) -> KeyPress {
