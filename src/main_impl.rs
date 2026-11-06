@@ -447,9 +447,12 @@ fn event_loop(
             let Some(mut batch) = state.server.handle_readable(fd) else { continue };
             let inject_enabled = state.inject_enabled;
             for line in std::mem::take(&mut batch.lines) {
-                let (command, mut reply) = match line {
-                    Ok(line) => crate::ipc_server::handle_command(&line, handler.current_mode(), inject_enabled),
-                    Err(reason) => (None, crate::ipc_server::Reply::Err(reason)),
+                let (command, mut reply) = match (line, ipc.as_mut()) {
+                    (Ok(line), Some(state)) => crate::ipc_server::handle_command(
+                        &line, handler.current_mode(), state.inject_enabled, &mut state.typist,
+                    ),
+                    (Err(reason), _) => (None, crate::ipc_server::Reply::Err(reason)),
+                    (_, None) => (None, crate::ipc_server::Reply::Err("IPC disabled".to_string())),
                 };
                 let mut next_action = None;
                 if let Some(command) = command {
@@ -535,6 +538,8 @@ fn select_readable<'a>(
 struct IpcState {
     server: IpcServer,
     inject_enabled: bool,
+    /// Resolves text to key chords for the `type` command.
+    typist: crate::typist::Typist,
 }
 
 const IPC_DEFAULT_DEVICE: &str = "xremap-ipc";
@@ -547,6 +552,7 @@ fn build_ipc(config: &Config) -> anyhow::Result<Option<IpcState>> {
     Ok(Some(IpcState {
         server,
         inject_enabled: ipc.inject,
+        typist: crate::typist::Typist::new(),
     }))
 }
 
@@ -556,6 +562,7 @@ fn sync_ipc(ipc: &mut Option<IpcState>, config: &Config) -> anyhow::Result<()> {
     match (&mut *ipc, &config.ipc) {
         (Some(state), Some(new_ipc)) if state.server.path() == new_ipc.socket => {
             state.inject_enabled = new_ipc.inject;
+            state.typist = crate::typist::Typist::new();
         }
         _ => {
             let replacement = build_ipc(config)?;
