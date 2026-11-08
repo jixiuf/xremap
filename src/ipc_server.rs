@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 // Commands:
 //   set-mode MODE      Switch the active keymap mode. → "ok"
 //   get-mode           Query the active mode. → "MODE"
+//   reload-config      Reload the config files. → "ok"
 //   ping               Liveness check. → "pong"
 //
 // Replies: "ok\n", "MODE\n", "pong\n", "err REASON\n".
@@ -30,6 +31,7 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(500);
 #[derive(Debug, Clone, PartialEq)]
 pub enum IpcCommand {
     SetMode(String),
+    ReloadConfig,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +86,7 @@ pub fn handle_command(line: &str, current_mode: &str) -> (Option<IpcCommand>, Re
             }
             (Some(IpcCommand::SetMode(arg.to_string())), Reply::Ok)
         }
+        "reload-config" => (Some(IpcCommand::ReloadConfig), Reply::Ok),
         "" => (None, Reply::Err("empty command".to_string())),
         _ => (None, Reply::Err("unknown command".to_string())),
     }
@@ -491,6 +494,11 @@ mod tests {
             let line = format!("set-mode {arg}");
             assert_eq!(cmd(&line, "insert").1, Reply::Err("invalid mode name".into()), "{arg:?}");
         }
+    }
+
+    #[test]
+    fn reload_config() {
+        assert_eq!(cmd("reload-config", "insert"), (Some(IpcCommand::ReloadConfig), Reply::Ok));
     }
 
     #[test]

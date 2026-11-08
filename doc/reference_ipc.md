@@ -30,6 +30,7 @@ shape as dotool's fifo protocol.
 ```
 set-mode MODE\n                          → ok\n
 get-mode\n                               → MODE\n
+reload-config\n                          → ok\n
 ping\n                                   → pong\n
 ```
 
@@ -48,6 +49,12 @@ are rejected and the connection is closed.
   other characters; the `get-mode` reply is the bare escaped mode name and
   stays on one line. Clients tell replies apart by order, and a reply is a
   failure exactly when it starts with `err`.
+- `reload-config` reloads the config files without touching devices. Runtime
+  mode and connections are preserved when the socket path stays the same.
+  Failed config loads or socket binds return `err` and retain the old config,
+  including its key aliases.
+  A path change replies on the old connection before it closes; reconnect to
+  the new path. Removing `ipc` disables further commands.
 
 ## Security
 

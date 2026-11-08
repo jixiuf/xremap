@@ -331,7 +331,8 @@ pub fn xremap_cli(mut plugin: impl Plugin) -> anyhow::Result<()> {
                 &timeout_manager,
                 &mut handler,
                 &mut dispatcher,
-                &config,
+                &mut config,
+                &config_paths,
                 &mut mainctrl,
                 &device_filter,
                 &ignore_filter,
@@ -391,7 +392,8 @@ fn event_loop(
     timeout_manager: &Rc<TimeoutManager>,
     handler: &mut EventHandler,
     dispatcher: &mut ActionDispatcher,
-    config: &Config,
+    config: &mut Config,
+    config_paths: &[PathBuf],
     mainctrl: &mut MainController,
     device_filter: &[String],
     ignore_filter: &[String],
@@ -448,7 +450,7 @@ fn event_loop(
                 };
                 let mut next_action = None;
                 if let Some(command) = command {
-                    match execute_ipc_command(command, handler) {
+                    match execute_ipc_command(command, ipc, config, config_paths, handler) {
                         Ok(action) => next_action = action,
                         Err(err) => reply = crate::ipc_server::Reply::Err(format!("{err:#}")),
                     }
@@ -552,21 +554,33 @@ fn sync_ipc(ipc: &mut Option<IpcState>, config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Accept parsing-time aliases only after both config loading and IPC setup
+/// succeed. Watcher/key-action reloads and IPC reloads share this transaction.
 fn reload_config(config_paths: &[PathBuf], ipc: &mut Option<IpcState>, full: bool) -> anyhow::Result<Config> {
+    let aliases = crate::config::key_aliases::KeyAliasTransaction::new();
     let config = load_configs(config_paths).map_err(|err| anyhow!("Failed to load config: {err}"))?;
     if !full {
         sync_ipc(ipc, &config)?;
     }
+    aliases.commit();
     Ok(config)
 }
 
 fn execute_ipc_command(
     command: IpcCommand,
+    ipc: &mut Option<IpcState>,
+    config: &mut Config,
+    config_paths: &[PathBuf],
     handler: &mut EventHandler,
 ) -> anyhow::Result<Option<MainAction>> {
     match command {
         IpcCommand::SetMode(mode) => {
             handler.set_mode_external(&mode);
+            Ok(None)
+        }
+        IpcCommand::ReloadConfig => {
+            *config = reload_config(config_paths, ipc, false)?;
+            println!("Config Reloaded");
             Ok(None)
         }
     }
