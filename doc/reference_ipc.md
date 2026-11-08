@@ -19,7 +19,7 @@ ipc:                    # omit the whole section to disable IPC entirely
 | Option | Default | Meaning |
 |---|---|---|
 | `socket` | (none — IPC off) | `true` for the default path, or an explicit path. `false` explicitly disables. |
-| `inject` | `false` | Gate for the whole injection command family (`key`, `keydown`, `keyup`). When off, the server answers `err injection disabled`. |
+| `inject` | `false` | Gate for the whole injection command family (`key`, `keydown`, `keyup`, `sleep`). When off, the server answers `err injection disabled`. |
 
 The default socket path falls back to `$TMPDIR/xremap-<uid>.sock` when
 `$XDG_RUNTIME_DIR` is unset.
@@ -37,6 +37,7 @@ ping\n                                   → pong\n
 key [--device NAME] [SCOPE] CHORD...\n   → ok\n
 keydown [--device NAME] [SCOPE] CHORD...\n → ok\n
 keyup [--device NAME] [SCOPE] CHORD...\n   → ok\n
+sleep MILLISECONDS\n                     → ok\n
 ```
 
 Commands on a connection execute in order, and each reply follows execution.
@@ -74,6 +75,11 @@ are rejected and the connection is closed.
 - `keydown`/`keyup` emit only the press / only the release half of each chord
   (`keydown ctrl+a` = ctrl↓ a↓, `keyup ctrl+a` = a↑ ctrl↑). Pair them
   yourself; held keys stay held.
+- `sleep` pauses command processing for 1..=5000 ms, so a command stream can
+  sequence keys with delays for applications that need them:
+  `printf 'key raw alt+f\nsleep 100\nkey raw down\n' | xremap --client`.
+  Note that it blocks xremap's event loop: no physical keys are remapped
+  while it sleeps, so keep the duration short.
 
 ## The `key` scopes
 
@@ -121,7 +127,7 @@ same output device and throttle as remapped keys.
   500 ms instead of stopping the daemon or spinning in the input loop.
 - Startup only removes stale sockets owned by xremap's effective uid. Live
   sockets, ordinary files, symlinks, and foreign sockets are not replaced.
-- The injection command family (`key`/`keydown`/`keyup`) is off by default
+- The injection command family (`key`/`keydown`/`keyup`/`sleep`) is off by default
   (`ipc.inject: false`) and only widens what a same-uid process can already do
   (e.g. via dotool/uinput). It does not grant cross-user power.
 
