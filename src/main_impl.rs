@@ -12,6 +12,7 @@ use crate::device::{
 };
 use crate::event::Event;
 use crate::event_handler::EventHandler;
+use crate::ipc_server::IpcServer;
 use crate::main_controller::MainController;
 use crate::operator_handler::OperatorHandler;
 use crate::plugin::{apply_plugin, Plugin};
@@ -23,6 +24,7 @@ use clap_complete::Shell;
 use nix::libc::ENODEV;
 use nix::sys::select::{select, FdSet};
 use nix::sys::timerfd::{ClockId, TimerFd, TimerFlags};
+use nix::sys::time::{TimeVal, TimeValLike};
 use std::collections::HashMap;
 use std::io::stdout;
 use std::os::fd::{AsFd, RawFd};
@@ -74,6 +76,7 @@ struct Args {
         required_unless_present = "device_details",
         required_unless_present = "list_windows",
         required_unless_present = "bridge",
+        required_unless_present = "client",
         num_args = 1.., verbatim_doc_comment)]
     configs: Vec<PathBuf>,
     /// Choose the vendor value of the created output device.
@@ -118,6 +121,22 @@ struct Args {
     /// Since v0.15.1
     #[arg(long, verbatim_doc_comment)]
     bridge: bool,
+    /// Run as an IPC client: send a command to a running xremap and print
+    /// the reply. Without a value, commands are read from stdin, one per line.
+    /// Commands: ping, get-mode, set-mode MODE, reload-config and, when
+    /// `ipc.inject` is enabled, key/keydown/keyup/type/click/wheel/hwheel/
+    /// mousemove/sleep. See doc/reference_ipc.md for the full protocol.
+    /// Examples
+    /// - xremap --client 'set-mode normal'
+    /// - echo 'key expmap ctrl+f' | xremap --client
+    /// - xremap --client 'click left'
+    /// Note: --socket must be given before --client.
+    #[arg(long, num_args = 0..=1, default_missing_value = "-", verbatim_doc_comment)]
+    client: Option<String>,
+    /// IPC socket path for --client. Default is $XDG_RUNTIME_DIR/xremap.sock,
+    /// overridable with XREMAP_SOCKET.
+    #[arg(long)]
+    socket: Option<PathBuf>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,9 +199,20 @@ pub fn xremap_cli(mut plugin: impl Plugin) -> anyhow::Result<()> {
         no_window_logging,
         allow_launch,
         bridge,
+        client,
+        socket,
     } = Args::parse();
 
     let desktop = desktop.unwrap_or(Desktop::Auto);
+
+    if let Some(client_command) = client {
+        let commands: Vec<String> = if client_command == "-" {
+            Vec::new()
+        } else {
+            vec![client_command]
+        };
+        return crate::client_mode::run(&commands, socket);
+    }
 
     if let Some(shell) = completions {
         clap_complete::generate(shell, &mut Args::command(), "xremap", &mut stdout());
@@ -253,6 +283,9 @@ pub fn xremap_cli(mut plugin: impl Plugin) -> anyhow::Result<()> {
         let mut config_watcher =
             ConfigWatcher::new(watch_config, config_paths.clone(), config.config_watch_debounce_ms)?;
 
+        // IPC server (disabled unless `ipc.socket` is set in the config)
+        let mut ipc = build_ipc(&config)?;
+
         // Default allow launch (Change to false in a major upgrade)
         let mut mainctrl = MainController::new(!no_window_logging, allow_launch.unwrap_or(true), desktop);
 
@@ -294,6 +327,7 @@ pub fn xremap_cli(mut plugin: impl Plugin) -> anyhow::Result<()> {
                 &mut input_devices,
                 &device_watcher,
                 &mut config_watcher,
+                &mut ipc,
                 &timeout_manager,
                 &mut handler,
                 &mut dispatcher,
@@ -310,7 +344,7 @@ pub fn xremap_cli(mut plugin: impl Plugin) -> anyhow::Result<()> {
                 MainAction::Exit => {
                     return Ok(());
                 }
-                MainAction::Reload { full } => match load_configs(&config_paths) {
+                MainAction::Reload { full } => match reload_config(&config_paths, &mut ipc, full) {
                     Ok(new_config) => {
                         config = new_config;
                         if config.notifications {
@@ -319,7 +353,6 @@ pub fn xremap_cli(mut plugin: impl Plugin) -> anyhow::Result<()> {
                         if full {
                             continue 'main_loop;
                         } else {
-                            // The new config is only partially used.
                             println!("Config Reloaded");
                             continue 'event_loop;
                         }
@@ -354,6 +387,7 @@ fn event_loop(
     input_devices: &mut HashMap<PathBuf, InputDevice>,
     device_watcher: &Option<DeviceWatcher>,
     config_watcher: &mut Option<ConfigWatcher>,
+    ipc: &mut Option<IpcState>,
     timeout_manager: &Rc<TimeoutManager>,
     handler: &mut EventHandler,
     dispatcher: &mut ActionDispatcher,
@@ -367,7 +401,7 @@ fn event_loop(
 ) -> anyhow::Result<MainAction> {
     'event_loop: loop {
         let readable_fds =
-            select_readable(input_devices.values(), &device_watcher, &config_watcher, &handler, &timeout_manager)?;
+            select_readable(input_devices.values(), &device_watcher, &config_watcher, ipc, &handler, &timeout_manager)?;
 
         if readable_fds.contains(&handler.as_fd().as_raw_fd()) {
             match handle_events(handler, dispatcher, &config, vec![Event::OverrideTimeout], mainctrl, plugin) {
@@ -399,6 +433,26 @@ fn event_loop(
             }
         }
 
+        let readable_ipc_fds: Vec<RawFd> = readable_fds
+            .iter()
+            .copied()
+            .filter(|fd| ipc.as_ref().is_some_and(|state| state.server.holds_fd(*fd)))
+            .collect();
+        for fd in readable_ipc_fds {
+            let Some(state) = ipc.as_mut() else { break };
+            let Some(mut batch) = state.server.handle_readable(fd) else { continue };
+            for line in std::mem::take(&mut batch.lines) {
+                let reply = match line {
+                    Ok(line) => crate::ipc_server::handle_command(&line),
+                    Err(reason) => crate::ipc_server::Reply::Err(reason),
+                };
+                if let Err(err) = batch.reply(&reply) {
+                    eprintln!("xremap ipc: failed to write reply: {err}");
+                    break;
+                }
+            }
+        }
+
         if let Some(device_watcher) = &device_watcher {
             if let Ok(events) = device_watcher.read_events() {
                 handle_device_changes(events, input_devices, &device_filter, &ignore_filter, mouse, &own_device);
@@ -419,14 +473,24 @@ fn select_readable<'a>(
     devices: impl Iterator<Item = &'a InputDevice>,
     device_watcher: &Option<DeviceWatcher>,
     config_watcher: &Option<ConfigWatcher>,
+    ipc: &Option<IpcState>,
     event_handler: &impl AsFd,
     timeout_manager: &Rc<TimeoutManager>,
 ) -> anyhow::Result<Vec<RawFd>> {
+    // Snapshot the retry delay before collecting fds, so an expiring backoff
+    // cannot leave a select call with neither a listener nor a wakeup timeout.
+    let mut timeout = ipc.as_ref().and_then(|state| state.server.accept_retry_delay())
+        .map(|delay| TimeVal::microseconds(delay.as_micros() as i64));
     let mut read_fds = FdSet::new();
     read_fds.insert(event_handler.as_fd());
     read_fds.insert(timeout_manager.as_fd());
     for device in devices {
         read_fds.insert(device.as_fd());
+    }
+    if let Some(ipc) = ipc {
+        for fd in ipc.server.fds() {
+            read_fds.insert(fd);
+        }
     }
     #[cfg(target_os = "linux")]
     if let Some(device_watcher) = device_watcher {
@@ -437,10 +501,44 @@ fn select_readable<'a>(
         read_fds.insert(config_watcher.borrow_timer());
         read_fds.insert(config_watcher.borrow_inotify());
     }
-    select(None, &mut read_fds, None, None, None)?;
+    select(None, &mut read_fds, None, None, timeout.as_mut())?;
 
     // Make the result independent of borrowed fds
     Ok(read_fds.fds(None).map(|fd| fd.as_raw_fd()).collect())
+}
+
+/// Runtime state of the IPC server.
+struct IpcState {
+    server: IpcServer,
+}
+
+fn build_ipc(config: &Config) -> anyhow::Result<Option<IpcState>> {
+    let Some(ipc) = &config.ipc else { return Ok(None) };
+    let server = IpcServer::new(&ipc.socket)
+        .with_context(|| format!("Failed to start IPC server on {}", ipc.socket.display()))?;
+    println!("IPC socket listening on {}", ipc.socket.display());
+    Ok(Some(IpcState { server }))
+}
+
+/// Preserve client connections at the same socket path. At a different path,
+/// bind first so a bind failure leaves the old IPC server/config usable.
+fn sync_ipc(ipc: &mut Option<IpcState>, config: &Config) -> anyhow::Result<()> {
+    match (&mut *ipc, &config.ipc) {
+        (Some(state), Some(new_ipc)) if state.server.path() == new_ipc.socket => {}
+        _ => {
+            let replacement = build_ipc(config)?;
+            *ipc = replacement;
+        }
+    }
+    Ok(())
+}
+
+fn reload_config(config_paths: &[PathBuf], ipc: &mut Option<IpcState>, full: bool) -> anyhow::Result<Config> {
+    let config = load_configs(config_paths).map_err(|err| anyhow!("Failed to load config: {err}"))?;
+    if !full {
+        sync_ipc(ipc, &config)?;
+    }
+    Ok(config)
 }
 
 fn handle_input_events(
