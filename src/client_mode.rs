@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context};
 use base64::Engine;
+use log::debug;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -18,6 +19,7 @@ pub fn run(commands: &[String], socket: Option<PathBuf>) -> anyhow::Result<()> {
 
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut failed = false;
+    debug!("client: sending {} command(s) to {}", commands.len(), path.display());
     if commands.is_empty() {
         // Stream commands from stdin over a single connection. stdin is the
         // command channel here, so `type --stdin` has no text to read.
@@ -47,6 +49,7 @@ pub fn run(commands: &[String], socket: Option<PathBuf>) -> anyhow::Result<()> {
 
 /// Returns true when the reply was a success.
 fn send_command(stream: &mut UnixStream, reader: &mut BufReader<UnixStream>, command: &str) -> anyhow::Result<bool> {
+    debug!("client: sent {:?} ({} bytes)", command, command.len());
     stream.write_all(command.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
