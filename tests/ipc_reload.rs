@@ -244,3 +244,36 @@ fn watcher_failures_preserve_key_aliases() {
         assert!(send(&daemon.socket, "key newalias*16 f14").starts_with("err invalid key:"));
     }
 }
+
+#[test]
+fn mouse_and_wheel_commands_are_dispatched_without_touching_keys() {
+    let mut daemon = DaemonGuard::start(true);
+    let mut stream = connect(&daemon.socket).unwrap();
+    let replies = exchange(&mut stream, "wheel -2\nhwheel 1\nmousemove 4 -4\nclick left middle right\nping\n", 5);
+    assert_eq!(replies, ["ok\n", "ok\n", "ok\n", "ok\n", "pong\n"]);
+    assert!(daemon.child.try_wait().unwrap().is_none());
+
+    // Parse errors are command-local.
+    let replies = exchange(&mut stream, "click up\nwheel x\nmousemove 1\nping\n", 4);
+    assert_eq!(
+        replies,
+        [
+            "err unknown button: up (left/middle/right)\n",
+            "err wheel takes an integer amount\n",
+            "err mousemove takes X and Y coordinates\n",
+            "pong\n"
+        ]
+    );
+}
+
+#[test]
+fn wheel_fails_loudly_when_enable_wheel_is_false() {
+    // The output device then has no REL_WHEEL/HWHEEL axis, and an emit on an
+    // unregistered axis is silently dropped, so the command must not reply `ok`.
+    let mut daemon = DaemonGuard::start_with_config(true, "enable_wheel: false\n", false);
+    let mut stream = connect(&daemon.socket).unwrap();
+    let replies = exchange(&mut stream, "wheel 1\nhwheel 1\nmousemove 1 1\nclick left\nping\n", 5);
+    let wheel_error = "err wheel events are disabled (set `enable_wheel: true` to inject them)\n";
+    assert_eq!(replies, [wheel_error, wheel_error, "ok\n", "ok\n", "pong\n"],);
+    assert!(daemon.child.try_wait().unwrap().is_none());
+}

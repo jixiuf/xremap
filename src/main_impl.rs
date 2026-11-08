@@ -11,7 +11,7 @@ use crate::device::{
     choose_device_name, open_device, output_device, print_device_details, print_device_list, select_input_devices,
     InputDevice, InputDeviceInfo,
 };
-use crate::event::Event;
+use crate::event::{Event, RelativeEvent};
 use crate::event_handler::EventHandler;
 use crate::ipc_server::{InjectScope, IpcCommand, IpcServer, KeyPhases};
 use crate::main_controller::MainController;
@@ -21,6 +21,7 @@ use crate::throttle_emit::ThrottleEmit;
 use crate::timeout_manager::TimeoutManager;
 use anyhow::{anyhow, bail, Context};
 use clap::{CommandFactory, Parser, ValueEnum};
+use evdev::RelativeAxisCode;
 use clap_complete::Shell;
 use nix::libc::ENODEV;
 use nix::sys::select::{select, FdSet};
@@ -606,6 +607,24 @@ fn execute_ipc_command(
             }
         }
         IpcCommand::Sleep(duration) => dispatcher.on_action(Action::Delay(duration), mainctrl),
+        IpcCommand::Wheel { horizontal, amount } => {
+            // Without `enable_wheel` the output device has no REL_WHEEL/HWHEEL
+            // axis, and emitting an unregistered axis is silently dropped by
+            // the kernel. Fail loudly instead of replying `ok` for no effect.
+            anyhow::ensure!(
+                config.enable_wheel,
+                "wheel events are disabled (set `enable_wheel: true` to inject them)"
+            );
+            let code = if horizontal { RelativeAxisCode::REL_HWHEEL.0 } else { RelativeAxisCode::REL_WHEEL.0 };
+            dispatcher.on_action(Action::RelativeEvent(RelativeEvent { code, value: amount }), mainctrl)
+        }
+        IpcCommand::MoveMouse { x, y } => dispatcher.on_action(
+            Action::MouseMovementEventCollection(vec![
+                RelativeEvent { code: RelativeAxisCode::REL_X.0, value: x },
+                RelativeEvent { code: RelativeAxisCode::REL_Y.0, value: y },
+            ]),
+            mainctrl,
+        ),
     }
 }
 
