@@ -12,7 +12,7 @@ use crate::device::{
 };
 use crate::event::Event;
 use crate::event_handler::EventHandler;
-use crate::ipc_server::{IpcCommand, IpcServer};
+use crate::ipc_server::{InjectScope, IpcCommand, IpcServer, KeyPhases};
 use crate::main_controller::MainController;
 use crate::operator_handler::OperatorHandler;
 use crate::plugin::{apply_plugin, Plugin};
@@ -443,14 +443,15 @@ fn event_loop(
         for fd in readable_ipc_fds {
             let Some(state) = ipc.as_mut() else { break };
             let Some(mut batch) = state.server.handle_readable(fd) else { continue };
+            let inject_enabled = state.inject_enabled;
             for line in std::mem::take(&mut batch.lines) {
                 let (command, mut reply) = match line {
-                    Ok(line) => crate::ipc_server::handle_command(&line, handler.current_mode()),
+                    Ok(line) => crate::ipc_server::handle_command(&line, handler.current_mode(), inject_enabled),
                     Err(reason) => (None, crate::ipc_server::Reply::Err(reason)),
                 };
                 let mut next_action = None;
                 if let Some(command) = command {
-                    match execute_ipc_command(command, ipc, config, config_paths, handler) {
+                    match execute_ipc_command(command, ipc, config, config_paths, handler, dispatcher, mainctrl) {
                         Ok(action) => next_action = action,
                         Err(err) => reply = crate::ipc_server::Reply::Err(format!("{err:#}")),
                     }
@@ -531,21 +532,29 @@ fn select_readable<'a>(
 /// Runtime state of the IPC server.
 struct IpcState {
     server: IpcServer,
+    inject_enabled: bool,
 }
+
+const IPC_DEFAULT_DEVICE: &str = "xremap-ipc";
 
 fn build_ipc(config: &Config) -> anyhow::Result<Option<IpcState>> {
     let Some(ipc) = &config.ipc else { return Ok(None) };
     let server = IpcServer::new(&ipc.socket)
         .with_context(|| format!("Failed to start IPC server on {}", ipc.socket.display()))?;
     println!("IPC socket listening on {}", ipc.socket.display());
-    Ok(Some(IpcState { server }))
+    Ok(Some(IpcState {
+        server,
+        inject_enabled: ipc.inject,
+    }))
 }
 
 /// Preserve client connections at the same socket path. At a different path,
 /// bind first so a bind failure leaves the old IPC server/config usable.
 fn sync_ipc(ipc: &mut Option<IpcState>, config: &Config) -> anyhow::Result<()> {
     match (&mut *ipc, &config.ipc) {
-        (Some(state), Some(new_ipc)) if state.server.path() == new_ipc.socket => {}
+        (Some(state), Some(new_ipc)) if state.server.path() == new_ipc.socket => {
+            state.inject_enabled = new_ipc.inject;
+        }
         _ => {
             let replacement = build_ipc(config)?;
             *ipc = replacement;
@@ -572,6 +581,8 @@ fn execute_ipc_command(
     config: &mut Config,
     config_paths: &[PathBuf],
     handler: &mut EventHandler,
+    dispatcher: &mut ActionDispatcher,
+    mainctrl: &mut MainController,
 ) -> anyhow::Result<Option<MainAction>> {
     match command {
         IpcCommand::SetMode(mode) => {
@@ -581,6 +592,69 @@ fn execute_ipc_command(
         IpcCommand::ReloadConfig => {
             *config = reload_config(config_paths, ipc, false)?;
             println!("Config Reloaded");
+            Ok(None)
+        }
+        IpcCommand::SendKey { scope, device, chords, phases } => {
+            let action = apply_send_key(scope, &device, &chords, phases, handler, dispatcher, config, mainctrl)?;
+            if matches!(action, Some(MainAction::Reload { full: false })) {
+                // A configured partial-reload key action has the same ordering
+                // contract as the explicit reload-config command.
+                execute_ipc_command(IpcCommand::ReloadConfig, ipc, config, config_paths, handler, dispatcher, mainctrl)
+            } else {
+                Ok(action)
+            }
+        }
+    }
+}
+
+fn apply_send_key(
+    scope: InjectScope,
+    device: &Option<String>,
+    chords: &[crate::ipc_server::Chord],
+    phases: KeyPhases,
+    handler: &mut EventHandler,
+    dispatcher: &mut ActionDispatcher,
+    config: &Config,
+    mainctrl: &mut MainController,
+) -> anyhow::Result<Option<MainAction>> {
+    let (down, up) = match phases {
+        KeyPhases::Tap => (true, true),
+        KeyPhases::Down => (true, false),
+        KeyPhases::Up => (false, true),
+    };
+    match scope {
+        // Raw: no rule applies, emit straight through the output device.
+        InjectScope::Raw => {
+            for chord in chords {
+                for action in chord.to_actions(down, up) {
+                    if let Some(main_action) = dispatcher.on_action(action, mainctrl)? {
+                        return Ok(Some(main_action));
+                    }
+                }
+            }
+            Ok(None)
+        }
+        // Keymap / Modmap / Expmap: feed pipeline events with the synthetic
+        // IPC device identity so `device:` conditions can match them.
+        InjectScope::Modmap | InjectScope::Keymap | InjectScope::Expmap => {
+            let device_info = Rc::new(InputDeviceInfo {
+                name: device.clone().unwrap_or_else(|| IPC_DEFAULT_DEVICE.to_string()),
+                path: PathBuf::from("ipc"),
+                product: 0,
+                vendor: 0,
+            });
+            let mut events = Vec::new();
+            for chord in chords {
+                events.extend(chord.to_events(device_info.clone(), down, up));
+            }
+            let actions = handler
+                .inject_events(events, scope, config, mainctrl.wmclient())
+                .map_err(|err| anyhow!("EventHandler failed: {err:?}"))?;
+            for action in actions {
+                if let Some(main_action) = dispatcher.on_action(action, mainctrl)? {
+                    return Ok(Some(main_action));
+                }
+            }
             Ok(None)
         }
     }

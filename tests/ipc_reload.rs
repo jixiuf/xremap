@@ -43,17 +43,19 @@ struct DaemonGuard {
 }
 
 impl DaemonGuard {
-    fn start() -> Self {
-        Self::start_with_config("", false)
+    fn start(inject: bool) -> Self {
+        Self::start_with_config(inject, "", false)
     }
 
-    fn start_with_config(extra: &str, watch_config: bool) -> Self {
+    /// `inject` gates the key commands; the reload and mode tests do not need it.
+    fn start_with_config(inject: bool, extra: &str, watch_config: bool) -> Self {
         let dir = std::env::temp_dir().join(format!("xremap-ipc-{}-{:x}", std::process::id(), fastrand::u64(..)));
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("config.yml");
         let socket = dir.join("test.sock");
         let log = dir.join("daemon.log");
-        std::fs::write(&config, format!("{extra}ipc:\n  socket: {}\n", socket.display())).unwrap();
+        std::fs::write(&config, format!("{extra}ipc:\n  socket: {}\n  inject: {}\n", socket.display(), inject))
+            .unwrap();
         let logfile = std::fs::File::create(&log).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_xremap"));
         command
@@ -126,7 +128,7 @@ impl Drop for DaemonGuard {
 
 #[test]
 fn socket_survives_a_config_reload() {
-    let mut daemon = DaemonGuard::start();
+    let mut daemon = DaemonGuard::start(false);
     let mut stream = connect(&daemon.socket).unwrap();
     // One write forces set/get/reload/get to share the same input batch.
     assert_eq!(
@@ -143,14 +145,14 @@ fn socket_survives_a_config_reload() {
 
     // A bind failure must also keep the current socket usable.
     let invalid_path = daemon.dir.join("missing/test.sock");
-    std::fs::write(&daemon.config, format!("ipc:\n  socket: {}\n", invalid_path.display())).unwrap();
+    std::fs::write(&daemon.config, format!("ipc:\n  socket: {}\n  inject: false\n", invalid_path.display())).unwrap();
     assert!(send(&daemon.socket, "reload-config").starts_with("err Failed to start IPC server"));
     assert_eq!(send(&daemon.socket, "ping"), "pong\n");
 
     // Successful path changes reply over the old connection, then accept new
     // clients at the new path and unlink the previous socket file.
     let socket2 = daemon.dir.join("test2.sock");
-    std::fs::write(&daemon.config, format!("ipc:\n  socket: {}\n", socket2.display())).unwrap();
+    std::fs::write(&daemon.config, format!("ipc:\n  socket: {}\n  inject: false\n", socket2.display())).unwrap();
     assert_eq!(send(&daemon.socket, "reload-config"), "ok\n");
     daemon.wait_for_socket(&socket2);
     assert!(!daemon.socket.exists());
@@ -159,7 +161,7 @@ fn socket_survives_a_config_reload() {
 
 #[test]
 fn mode_replies_escape_config_values_without_desynchronizing_clients() {
-    let daemon = DaemonGuard::start_with_config("default_mode: \"first\\nsecond\\rthird\\\\four\"\n", false);
+    let daemon = DaemonGuard::start_with_config(false, "default_mode: \"first\\nsecond\\rthird\\\\four\"\n", false);
     let mut stream = connect(&daemon.socket).unwrap();
     let replies = exchange(&mut stream, "get-mode\nping\nget-mode\n", 3);
     assert_eq!(
@@ -174,7 +176,7 @@ fn mode_replies_escape_config_values_without_desynchronizing_clients() {
 
 #[test]
 fn client_accepts_a_complete_command_as_one_argument() {
-    let daemon = DaemonGuard::start();
+    let daemon = DaemonGuard::start(false);
     let output = Command::new(env!("CARGO_BIN_EXE_xremap"))
         .arg("--socket")
         .arg(&daemon.socket)
@@ -185,4 +187,60 @@ fn client_accepts_a_complete_command_as_one_argument() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(output.stdout, b"ok\n");
     assert_eq!(send(&daemon.socket, "get-mode"), "normal\n");
+}
+
+#[test]
+fn failed_reloads_preserve_key_aliases() {
+    let daemon = DaemonGuard::start_with_config(true, "key_aliases:\n  oldalias: f13\n", false);
+    let mut stream = connect(&daemon.socket).unwrap();
+    // Too many chords is a parse-only probe: alias lookup succeeds, but no
+    // key events are executed. An unknown alias instead fails key parsing.
+    let probe = "key oldalias*16 f14\n";
+    assert_eq!(exchange(&mut stream, probe, 1), ["err too many chords (max 16)\n"]);
+    let invalid_path = daemon.dir.join("missing/control.sock");
+    let failures = [
+        ("ipc: [\n".to_string(), "err Failed to load config:"),
+        ("key_aliases:\n  newalias: f14\nunknown_field: true\n".to_string(), "err Failed to load config:"),
+        (
+            format!("key_aliases:\n  newalias: f14\nipc:\n  socket: {}\n  inject: true\n", invalid_path.display()),
+            "err Failed to start IPC server",
+        ),
+    ];
+    for (config, error) in failures {
+        std::fs::write(&daemon.config, config).unwrap();
+        let replies = exchange(&mut stream, &format!("reload-config\n{probe}ping\n"), 3);
+        assert!(replies[0].starts_with(error), "{replies:?}");
+        assert_eq!(&replies[1..], ["err too many chords (max 16)\n", "pong\n"]);
+        assert!(send(&daemon.socket, "key newalias*16 f14").starts_with("err invalid key:"));
+    }
+
+    // Successful reloads must commit the new aliases rather than roll back.
+    std::fs::write(
+        &daemon.config,
+        format!("key_aliases:\n  newalias: f14\nipc:\n  socket: {}\n  inject: true\n", daemon.socket.display()),
+    )
+    .unwrap();
+    assert_eq!(send(&daemon.socket, "reload-config"), "ok\n");
+    assert_eq!(send(&daemon.socket, "key newalias*16 f14"), "err too many chords (max 16)\n");
+    assert!(send(&daemon.socket, "key oldalias*16 f14").starts_with("err invalid key:"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn watcher_failures_preserve_key_aliases() {
+    let mut daemon = DaemonGuard::start_with_config(true, "key_aliases:\n  oldalias: f13\n", true);
+    let invalid_path = daemon.dir.join("missing/control.sock");
+    let failures = [
+        ("ipc: [\n".to_string(), "Config error: Failed to load config:"),
+        (
+            format!("key_aliases:\n  newalias: f14\nipc:\n  socket: {}\n  inject: true\n", invalid_path.display()),
+            "Config error: Failed to start IPC server",
+        ),
+    ];
+    for (config, error) in failures {
+        std::fs::write(&daemon.config, config).unwrap();
+        daemon.wait_for_log(error, 1);
+        assert_eq!(send(&daemon.socket, "key oldalias*16 f14"), "err too many chords (max 16)\n");
+        assert!(send(&daemon.socket, "key newalias*16 f14").starts_with("err invalid key:"));
+    }
 }
